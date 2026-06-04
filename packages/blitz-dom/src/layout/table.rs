@@ -36,6 +36,12 @@ pub struct TableContext {
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
+    /// `table-layout: fixed` (vs `auto`). In fixed mode column widths come only
+    /// from `<col>` and the first row and content does not grow columns.
+    pub is_fixed: bool,
+    /// Authored `<col>` / `<colgroup>` widths, indexed by column (auto where
+    /// none). Used as a column's specified width by the L3 algorithm.
+    pub col_sizes: Vec<taffy::Dimension>,
 }
 
 // #[derive(Debug, Clone, Eq, PartialEq)]
@@ -105,6 +111,7 @@ pub(crate) fn build_table_context(
     drop(stylo_styles);
 
     let mut column_sizes: Vec<taffy::TrackSizingFunction> = Vec::new();
+    let mut col_sizes: Vec<taffy::Dimension> = Vec::new();
     let mut first_cell_border: Option<ServoArc<Border>> = None;
     for child_id in children.iter().copied() {
         collect_table_cells(
@@ -117,10 +124,12 @@ pub(crate) fn build_table_context(
             &mut cells,
             &mut rows,
             &mut column_sizes,
+            &mut col_sizes,
             &mut first_cell_border,
         );
     }
     column_sizes.resize(col as usize, style_helpers::auto());
+    col_sizes.resize(col as usize, taffy::Dimension::auto());
 
     style.grid_template_columns = column_sizes.into_iter().map(|dim| dim.into()).collect();
     style.grid_template_rows = vec![style_helpers::auto(); row as usize];
@@ -172,6 +181,8 @@ pub(crate) fn build_table_context(
             computed_grid_info: AtomicRefCell::new(None),
             border_collapse,
             border_style: first_cell_border,
+            is_fixed,
+            col_sizes,
         },
         layout_children,
     )
@@ -188,6 +199,7 @@ pub(crate) fn collect_table_cells(
     cells: &mut Vec<TableCell>,
     rows: &mut Vec<TableRow>,
     columns: &mut Vec<TrackSizingFunction>,
+    col_sizes: &mut Vec<taffy::Dimension>,
     first_cell_border: &mut Option<ServoArc<Border>>,
 ) {
     let node = &mut doc.nodes[node_id];
@@ -226,6 +238,7 @@ pub(crate) fn collect_table_cells(
                     cells,
                     rows,
                     columns,
+                    col_sizes,
                     first_cell_border,
                 );
             }
@@ -253,6 +266,7 @@ pub(crate) fn collect_table_cells(
                     cells,
                     rows,
                     columns,
+                    col_sizes,
                     first_cell_border,
                 );
             }
@@ -339,9 +353,68 @@ pub(crate) fn collect_table_cells(
             //     display.inside()
             // );
         }
-        DisplayInside::TableColumnGroup | DisplayInside::TableColumn | DisplayInside::Table => {
+        DisplayInside::TableColumn => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            //Ignore
+            let span = node
+                .attr(local_name!("span"))
+                .and_then(|v| v.parse::<u16>().ok())
+                .map(|v| v.clamp(1, 1000))
+                .unwrap_or(1);
+            let width = node
+                .primary_styles()
+                .map(|s| stylo_taffy::to_taffy_style(&s).size.width)
+                .unwrap_or(taffy::Dimension::auto());
+            for _ in 0..span {
+                col_sizes.push(width);
+            }
+        }
+        DisplayInside::TableColumnGroup => {
+            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            let children = std::mem::take(&mut doc.nodes[node_id].children);
+            let has_cols = children.iter().any(|&c| {
+                doc.nodes[c]
+                    .primary_styles()
+                    .map(|s| s.clone_display().inside() == DisplayInside::TableColumn)
+                    .unwrap_or(false)
+            });
+            if has_cols {
+                // The contained <col> elements define the columns.
+                for child_id in children.iter().copied() {
+                    collect_table_cells(
+                        doc,
+                        child_id,
+                        is_fixed,
+                        border_collapse,
+                        row,
+                        col,
+                        cells,
+                        rows,
+                        columns,
+                        col_sizes,
+                        first_cell_border,
+                    );
+                }
+            } else {
+                // A column group with no <col> children spans `span` columns.
+                let group = &doc.nodes[node_id];
+                let span = group
+                    .attr(local_name!("span"))
+                    .and_then(|v| v.parse::<u16>().ok())
+                    .map(|v| v.clamp(1, 1000))
+                    .unwrap_or(1);
+                let width = group
+                    .primary_styles()
+                    .map(|s| stylo_taffy::to_taffy_style(&s).size.width)
+                    .unwrap_or(taffy::Dimension::auto());
+                for _ in 0..span {
+                    col_sizes.push(width);
+                }
+            }
+            doc.nodes[node_id].children = children;
+        }
+        DisplayInside::Table => {
+            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            //Ignore nested table
         }
         DisplayInside::None => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -396,10 +469,18 @@ impl TableTreeWrapper<'_> {
             .collect();
 
         // Only take over column sizing where Taffy's generic grid track sizing is
-        // actually wrong for tables: percentage column widths and/or spanning
-        // (colspan) cells. Plain auto/length tables keep Taffy's native sizing
-        // (and its exact sub-pixel results), so this change can't regress them.
-        let needs_l3 = facts.iter().any(|f| f.pct.is_some() || f.span > 1);
+        // actually wrong for tables: percentage column widths, spanning (colspan)
+        // cells, `<col>`-defined widths, or `table-layout: fixed`. Plain auto/length
+        // tables keep Taffy's native sizing (and its exact sub-pixel results), so
+        // this change can't regress them.
+        let has_col_size = self
+            .ctx
+            .col_sizes
+            .iter()
+            .any(|d| d.tag() != taffy::CompactLength::AUTO_TAG);
+        let needs_l3 = self.ctx.is_fixed
+            || has_col_size
+            || facts.iter().any(|f| f.pct.is_some() || f.span > 1);
         if !needs_l3 {
             return;
         }
@@ -478,6 +559,37 @@ impl TableTreeWrapper<'_> {
             col_max_full[i] = col_max_full[i].max(col_min_full[i]);
         }
 
+        // (3b) Per-column authored width from `<col>` and (for fixed layout) the
+        // first row: explicit lengths (`col_len`) and percentages fold into the
+        // distribution. `<col>` takes precedence over a first-row cell.
+        let mut col_len: Vec<Option<f32>> = vec![None; n];
+        for c in 0..n {
+            match self.ctx.col_sizes[c].tag() {
+                taffy::CompactLength::LENGTH_TAG => {
+                    col_len[c] = Some(self.ctx.col_sizes[c].value())
+                }
+                taffy::CompactLength::PERCENT_TAG => {
+                    col_pct[c] = col_pct[c].max(self.ctx.col_sizes[c].value())
+                }
+                _ => {}
+            }
+        }
+        for f in &facts {
+            if f.span == 1 && f.col < n {
+                let sw = self.ctx.cells[f.idx].specified_width;
+                if sw.tag() == taffy::CompactLength::LENGTH_TAG && col_len[f.col].is_none() {
+                    col_len[f.col] = Some(sw.value());
+                }
+            }
+        }
+        // An explicit length is at least a floor for its column.
+        for c in 0..n {
+            if let Some(l) = col_len[c] {
+                col_min[c] = col_min[c].max(l);
+                col_max[c] = col_max[c].max(l);
+            }
+        }
+
         // (4) Resolve the inset (table border/padding + inter-column gaps) that
         // sits between the table border-box width and the column area.
         let parent = inputs.parent_size;
@@ -503,8 +615,26 @@ impl TableTreeWrapper<'_> {
                 _ => None,
             }
         };
-        let widths: Vec<f32> = if let Some(table_w) = inputs.known_dimensions.width {
-            // Definite border-box width already resolved by the parent.
+        // The table's definite border-box width, if any (resolved by the parent,
+        // or the table's own length/percentage width).
+        let used_width: Option<f32> = inputs.known_dimensions.width.or_else(|| {
+            match inputs.available_space.width {
+                taffy::AvailableSpace::Definite(avail_w) => own_width(Some(avail_w)),
+                _ => None,
+            }
+        });
+
+        let widths: Vec<f32> = if self.ctx.is_fixed {
+            // Fixed table layout: columns come only from `<col>`/first-row widths;
+            // content never grows a column.
+            match used_width {
+                Some(table_w) => {
+                    distribute_fixed(Some((table_w - insets).max(0.0)), &col_len, &col_pct, &col_min)
+                }
+                None => distribute_fixed(None, &col_len, &col_pct, &col_min),
+            }
+        } else if let Some(table_w) = used_width {
+            // Auto layout, definite width → distribute it across columns.
             distribute_columns((table_w - insets).max(0.0), &col_min, &col_max, &col_pct)
         } else {
             match inputs.available_space.width {
@@ -513,17 +643,12 @@ impl TableTreeWrapper<'_> {
                 taffy::AvailableSpace::MinContent => col_min_full.clone(),
                 taffy::AvailableSpace::MaxContent => col_max_full.clone(),
                 taffy::AvailableSpace::Definite(avail_w) => {
-                    if let Some(table_w) = own_width(Some(avail_w)) {
-                        // Table has a definite width → fill it.
-                        distribute_columns((table_w - insets).max(0.0), &col_min, &col_max, &col_pct)
+                    // Auto width → shrink-to-fit, capped at the available space.
+                    let avail = (avail_w - insets).max(0.0);
+                    if col_max_full.iter().sum::<f32>() <= avail {
+                        col_max_full.clone()
                     } else {
-                        // Auto width → shrink-to-fit, capped at the available space.
-                        let avail = (avail_w - insets).max(0.0);
-                        if col_max_full.iter().sum::<f32>() <= avail {
-                            col_max_full.clone()
-                        } else {
-                            distribute_columns(avail, &col_min, &col_max, &col_pct)
-                        }
+                        distribute_columns(avail, &col_min, &col_max, &col_pct)
                     }
                 }
             }
@@ -576,6 +701,49 @@ impl TableTreeWrapper<'_> {
 /// percentages exceed 100%); the remaining columns take at least their content
 /// min and then absorb leftover space (first growing toward max-content, then
 /// stretching). When percentages over-allocate, columns shrink toward their min.
+/// Fixed table-layout column widths. Columns with an explicit length take it,
+/// percentage columns take `pct * avail`, and the remaining (auto) columns split
+/// whatever is left equally. Content never grows a column. With no definite table
+/// width (`avail = None`) the table's width is the sum of the explicit/auto column
+/// widths (auto columns falling back to their content min).
+fn distribute_fixed(
+    avail: Option<f32>,
+    col_len: &[Option<f32>],
+    pct: &[f32],
+    col_min: &[f32],
+) -> Vec<f32> {
+    let n = col_len.len();
+    let Some(avail) = avail else {
+        return (0..n).map(|c| col_len[c].unwrap_or(col_min[c])).collect();
+    };
+    let mut w = vec![0f32; n];
+    let mut fixed_total = 0.0;
+    let mut auto_cols = Vec::new();
+    for c in 0..n {
+        if let Some(l) = col_len[c] {
+            w[c] = l;
+            fixed_total += l;
+        } else if pct[c] > 0.0 {
+            w[c] = pct[c] * avail;
+            fixed_total += w[c];
+        } else {
+            auto_cols.push(c);
+        }
+    }
+    let remaining = (avail - fixed_total).max(0.0);
+    if !auto_cols.is_empty() {
+        let share = remaining / auto_cols.len() as f32;
+        for c in auto_cols {
+            w[c] = share;
+        }
+    } else if fixed_total > 0.0 && remaining > 0.0 {
+        for c in 0..n {
+            w[c] += remaining * w[c] / fixed_total;
+        }
+    }
+    w
+}
+
 fn distribute_columns(avail: f32, min: &[f32], max: &[f32], pct: &[f32]) -> Vec<f32> {
     let n = min.len();
     let psum: f32 = pct.iter().sum();
