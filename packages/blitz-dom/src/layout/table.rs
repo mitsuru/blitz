@@ -21,6 +21,11 @@ use super::resolve_calc_value;
 pub struct TableTreeWrapper<'doc> {
     pub(crate) doc: &'doc mut BaseDocument,
     pub(crate) ctx: Arc<TableContext>,
+    /// Per-layout-call container style. When set, its `grid_template_columns`
+    /// holds the L3-resolved fixed pixel column widths and is served to Taffy in
+    /// place of `ctx.style` (whose template tracks are only a fallback). Computed
+    /// by [`TableTreeWrapper::prepare_columns`] before `compute_grid_layout`.
+    pub(crate) style_override: Option<taffy::Style<Atom>>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +49,14 @@ pub struct TableCell {
     // kind: TableItemKind,
     node_id: usize,
     style: taffy::Style<Atom>,
+    /// 0-based grid column of the cell's left edge.
+    col_start: u16,
+    /// Number of columns the cell spans (>= 1).
+    colspan: u16,
+    /// The cell's authored inline size, captured before `style.size.width` is
+    /// reset to `auto()` for Taffy placement. Drives the L3 column algorithm
+    /// (PERCENT_TAG / LENGTH_TAG / AUTO_TAG carried verbatim).
+    specified_width: taffy::Dimension,
 }
 
 #[derive(Debug, Clone)]
@@ -303,8 +316,15 @@ pub(crate) fn collect_table_cells(
                 start: style_helpers::line(*row as i16),
                 end: style_helpers::span(rowspan),
             };
+            let specified_width = style.size.width;
             style.size.width = style_helpers::auto();
-            cells.push(TableCell { node_id, style });
+            cells.push(TableCell {
+                node_id,
+                style,
+                col_start: *col,
+                colspan,
+                specified_width,
+            });
 
             *col += colspan;
         }
@@ -340,6 +360,278 @@ impl Iterator for RangeIter {
     }
 }
 
+impl TableTreeWrapper<'_> {
+    /// Compute the table's column widths with the CSS Tables L3 algorithm and
+    /// stash them in [`Self::style_override`] as fixed pixel `length()` tracks,
+    /// so the subsequent `compute_grid_layout` call only does cell placement and
+    /// row sizing rather than (mis)sizing columns via generic grid track rules.
+    pub(crate) fn prepare_columns(&mut self, inputs: taffy::tree::LayoutInput) {
+        let n = self.ctx.style.grid_template_columns.len();
+        if n == 0 {
+            return;
+        }
+
+        // (1) Snapshot per-cell facts so we can measure without borrowing `ctx`.
+        struct CellFact {
+            idx: usize,
+            col: usize,
+            span: usize,
+            pct: Option<f32>,
+        }
+        let facts: Vec<CellFact> = self
+            .ctx
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let pct = (c.specified_width.tag() == taffy::CompactLength::PERCENT_TAG)
+                    .then(|| c.specified_width.value());
+                CellFact {
+                    idx: i,
+                    col: c.col_start as usize,
+                    span: (c.colspan.max(1)) as usize,
+                    pct,
+                }
+            })
+            .collect();
+
+        // Only take over column sizing where Taffy's generic grid track sizing is
+        // actually wrong for tables: percentage column widths and/or spanning
+        // (colspan) cells. Plain auto/length tables keep Taffy's native sizing
+        // (and its exact sub-pixel results), so this change can't regress them.
+        let needs_l3 = facts.iter().any(|f| f.pct.is_some() || f.span > 1);
+        if !needs_l3 {
+            return;
+        }
+
+        // (2) Measure each cell's content min/max-content inline size with an
+        // INDEFINITE parent width, so the cell's own `width:%` resolves to auto
+        // (percentages don't resolve during intrinsic sizing) and the true
+        // content — including wide fixed-size children — surfaces. Absolute
+        // `width:<len>` still resolves to its length.
+        let mut cell_min = vec![0f32; facts.len()];
+        let mut cell_max = vec![0f32; facts.len()];
+        for f in &facts {
+            cell_min[f.idx] = self.measure_cell(f.idx, taffy::AvailableSpace::MinContent);
+            cell_max[f.idx] = self.measure_cell(f.idx, taffy::AvailableSpace::MaxContent);
+        }
+
+        // (3) Aggregate per-column min/max from non-spanning (colspan==1) cells.
+        // These single-cell content sizes are the floors used when the table has a
+        // definite width: a spanning cell's own content must NOT inflate an
+        // individual column there (it overflows instead — matching browsers), so
+        // spanning min/max only feed the table's intrinsic size (the `_full`
+        // arrays below, used in the indefinite/measure passes).
+        let mut col_min = vec![0f32; n];
+        let mut col_max = vec![0f32; n];
+        let mut col_pct = vec![0f32; n];
+        for f in &facts {
+            if f.span == 1 && f.col < n {
+                col_min[f.col] = col_min[f.col].max(cell_min[f.idx]);
+                col_max[f.col] = col_max[f.col].max(cell_max[f.idx]);
+                if let Some(p) = f.pct {
+                    col_pct[f.col] = col_pct[f.col].max(p);
+                }
+            }
+        }
+        let mut col_min_full = col_min.clone();
+        let mut col_max_full = col_max.clone();
+        // Spanning cells distribute any excess min/max/percent across the columns
+        // they span (smallest spans first), never dropping a single column below
+        // its own intrinsic size — so a colspan cell is not the sole determiner of
+        // any one column's width (CSS Tables 3 spanning distribution). Percent is
+        // shared by both code paths; min/max feed only the intrinsic arrays.
+        let mut spans: Vec<&CellFact> = facts.iter().filter(|f| f.span > 1).collect();
+        spans.sort_by_key(|f| f.span);
+        for f in spans {
+            let end = (f.col + f.span).min(n);
+            if f.col >= end {
+                continue;
+            }
+            let cnt = (end - f.col) as f32;
+            let cur_min: f32 = (f.col..end).map(|i| col_min_full[i]).sum();
+            if cell_min[f.idx] > cur_min {
+                let add = (cell_min[f.idx] - cur_min) / cnt;
+                for i in f.col..end {
+                    col_min_full[i] += add;
+                }
+            }
+            let cur_max: f32 = (f.col..end).map(|i| col_max_full[i]).sum();
+            if cell_max[f.idx] > cur_max {
+                let add = (cell_max[f.idx] - cur_max) / cnt;
+                for i in f.col..end {
+                    col_max_full[i] += add;
+                }
+            }
+            if let Some(p) = f.pct {
+                let cur_p: f32 = (f.col..end).map(|i| col_pct[i]).sum();
+                if p > cur_p {
+                    let add = (p - cur_p) / cnt;
+                    for i in f.col..end {
+                        col_pct[i] += add;
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            col_max[i] = col_max[i].max(col_min[i]);
+            col_max_full[i] = col_max_full[i].max(col_min_full[i]);
+        }
+
+        // (4) Resolve the inset (table border/padding + inter-column gaps) that
+        // sits between the table border-box width and the column area.
+        let parent = inputs.parent_size;
+        let border = self.ctx.style.border.resolve_or_zero(parent, resolve_calc_value);
+        let padding = self.ctx.style.padding.resolve_or_zero(parent, resolve_calc_value);
+        let gap = self
+            .ctx
+            .style
+            .gap
+            .width
+            .resolve_or_zero(parent.width, resolve_calc_value);
+        let insets =
+            border.left + border.right + padding.left + padding.right + gap * (n as f32 - 1.0);
+
+        // (5) Pick column pixel widths.
+        // Resolve the table's own definite width (length, or percentage of a
+        // definite containing block). `auto` stays `None` → shrink-to-fit.
+        let own_width = |avail_basis: Option<f32>| -> Option<f32> {
+            let w = &self.ctx.style.size.width;
+            match w.tag() {
+                taffy::CompactLength::LENGTH_TAG => Some(w.value()),
+                taffy::CompactLength::PERCENT_TAG => avail_basis.map(|b| b * w.value()),
+                _ => None,
+            }
+        };
+        let widths: Vec<f32> = if let Some(table_w) = inputs.known_dimensions.width {
+            // Definite border-box width already resolved by the parent.
+            distribute_columns((table_w - insets).max(0.0), &col_min, &col_max, &col_pct)
+        } else {
+            match inputs.available_space.width {
+                // Intrinsic-size passes: percentages are auto, spanning content
+                // contributes — report the table's own min/max-content columns.
+                taffy::AvailableSpace::MinContent => col_min_full.clone(),
+                taffy::AvailableSpace::MaxContent => col_max_full.clone(),
+                taffy::AvailableSpace::Definite(avail_w) => {
+                    if let Some(table_w) = own_width(Some(avail_w)) {
+                        // Table has a definite width → fill it.
+                        distribute_columns((table_w - insets).max(0.0), &col_min, &col_max, &col_pct)
+                    } else {
+                        // Auto width → shrink-to-fit, capped at the available space.
+                        let avail = (avail_w - insets).max(0.0);
+                        if col_max_full.iter().sum::<f32>() <= avail {
+                            col_max_full.clone()
+                        } else {
+                            distribute_columns(avail, &col_min, &col_max, &col_pct)
+                        }
+                    }
+                }
+            }
+        };
+
+        // (6) Serve the resolved fixed-length tracks; Taffy now only places cells
+        // and sizes rows.
+        let mut style = self.ctx.style.clone();
+        style.grid_template_columns = widths
+            .into_iter()
+            .map(|w| {
+                let track: TrackSizingFunction = style_helpers::length(w);
+                track.into()
+            })
+            .collect();
+        self.style_override = Some(style);
+    }
+
+    fn measure_cell(&mut self, idx: usize, width: taffy::AvailableSpace) -> f32 {
+        use taffy::tree::LayoutInput;
+        self.compute_child_layout(
+            idx.into(),
+            LayoutInput {
+                run_mode: taffy::RunMode::ComputeSize,
+                sizing_mode: taffy::SizingMode::InherentSize,
+                axis: taffy::RequestedAxis::Horizontal,
+                known_dimensions: taffy::Size::NONE,
+                parent_size: taffy::Size {
+                    width: None,
+                    height: None,
+                },
+                available_space: taffy::Size {
+                    width,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                vertical_margins_are_collapsible: taffy::Line {
+                    start: false,
+                    end: false,
+                },
+            },
+        )
+        .size
+        .width
+    }
+}
+
+/// Distribute a definite `avail` width across columns described by their
+/// content `min`/`max` and intrinsic `pct` (0.0 = no percentage). Percentage
+/// columns claim `pct * avail` (floored by their content min, scaled down if the
+/// percentages exceed 100%); the remaining columns take at least their content
+/// min and then absorb leftover space (first growing toward max-content, then
+/// stretching). When percentages over-allocate, columns shrink toward their min.
+fn distribute_columns(avail: f32, min: &[f32], max: &[f32], pct: &[f32]) -> Vec<f32> {
+    let n = min.len();
+    let psum: f32 = pct.iter().sum();
+    let scale = if psum > 1.0 { 1.0 / psum } else { 1.0 };
+
+    let mut w = vec![0f32; n];
+    for i in 0..n {
+        w[i] = if pct[i] > 0.0 {
+            (pct[i] * scale * avail).max(min[i])
+        } else {
+            min[i]
+        };
+    }
+
+    let assigned: f32 = w.iter().sum();
+    if assigned + 0.01 < avail {
+        let mut remaining = avail - assigned;
+        // Grow non-percentage columns toward their max-content first.
+        let grow: Vec<f32> = (0..n)
+            .map(|i| if pct[i] == 0.0 { (max[i] - w[i]).max(0.0) } else { 0.0 })
+            .collect();
+        let gsum: f32 = grow.iter().sum();
+        if gsum > 0.0 {
+            let take = remaining.min(gsum);
+            for i in 0..n {
+                w[i] += take * grow[i] / gsum;
+            }
+            remaining -= take;
+        }
+        // Stretch any leftover across non-percentage columns (or all columns if
+        // every column is a percentage column).
+        if remaining > 0.0 {
+            let targets: Vec<usize> = {
+                let np: Vec<usize> = (0..n).filter(|&i| pct[i] == 0.0).collect();
+                if np.is_empty() { (0..n).collect() } else { np }
+            };
+            let share = remaining / targets.len() as f32;
+            for i in targets {
+                w[i] += share;
+            }
+        }
+    } else if assigned > avail + 0.01 {
+        // Percentages over-allocated: shrink columns toward their min.
+        let excess = assigned - avail;
+        let shrink: Vec<f32> = (0..n).map(|i| (w[i] - min[i]).max(0.0)).collect();
+        let ssum: f32 = shrink.iter().sum();
+        if ssum > 0.0 {
+            let take = excess.min(ssum);
+            for i in 0..n {
+                w[i] -= take * shrink[i] / ssum;
+            }
+        }
+    }
+    w
+}
+
 impl taffy::TraversePartialTree for TableTreeWrapper<'_> {
     type ChildIter<'a>
         = RangeIter
@@ -372,7 +664,7 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_> {
     type CustomIdent = Atom;
 
     fn get_core_container_style(&self, _node_id: taffy::NodeId) -> &taffy::Style<Atom> {
-        &self.ctx.style
+        self.style_override.as_ref().unwrap_or(&self.ctx.style)
     }
 
     fn resolve_calc_value(&self, calc_ptr: *const (), parent_size: f32) -> f32 {

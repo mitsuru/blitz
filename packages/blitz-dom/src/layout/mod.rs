@@ -252,7 +252,9 @@ impl BaseDocument {
                     let mut table_wrapper = TableTreeWrapper {
                         doc: self,
                         ctx: context,
+                        style_override: None,
                     };
+                    table_wrapper.prepare_columns(inputs);
                     let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
 
                     // HACK: Cap content size at node size to prevent scrolling
