@@ -263,6 +263,10 @@ impl DocumentMutator<'_> {
             element.id = Some(Atom::from(value))
         }
 
+        if *tag == local_name!("table") && *attr == local_name!("cellpadding") {
+            element.parsed_cellpadding = value.parse::<u32>().ok();
+        }
+
         if *attr == local_name!("value") {
             if let Some(input_data) = element.text_input_data_mut() {
                 // Update text input value
@@ -343,6 +347,12 @@ impl DocumentMutator<'_> {
 
         if name.local == local_name!("id") {
             element.id = None;
+        }
+
+        if element.name.local == local_name!("table")
+            && name.local == local_name!("cellpadding")
+        {
+            element.parsed_cellpadding = None;
         }
 
         // Update text input value

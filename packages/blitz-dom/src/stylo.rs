@@ -1044,7 +1044,7 @@ impl<'a> TElement for BlitzNode<'a> {
                     cur = parent.parent;
                     continue;
                 }
-                if let Some(px) = pe.attr_parsed::<u32>(local_name!("cellpadding")) {
+                if let Some(px) = pe.parsed_cellpadding {
                     push_cell_padding(&mut push_style, px as f32);
                 }
                 break;

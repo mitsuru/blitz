@@ -68,6 +68,12 @@ pub struct ElementData {
 
     /// The element's template contents (\<template\> elements only)
     pub template_contents: Option<usize>,
+
+    /// Parsed `cellpadding` attribute value (tables only). Cached at element
+    /// construction / attribute mutation time so cells can read a table's
+    /// cellpadding without re-parsing the string per-cell during style
+    /// resolution. Mirrors Gecko's `mTableInheritedAttributes`.
+    pub parsed_cellpadding: Option<u32>,
     // /// Whether the node is a [HTML integration point] (https://html.spec.whatwg.org/multipage/#html-integration-point)
     // pub mathml_annotation_xml_integration_point: bool,
 }
@@ -148,6 +154,15 @@ impl ElementData {
             .map(|attr| attr.value.as_ref())
             .map(|value: &str| Atom::from(value));
 
+        let parsed_cellpadding = (name.local == local_name!("table"))
+            .then(|| {
+                attrs
+                    .iter()
+                    .find(|attr| attr.name.local == local_name!("cellpadding"))
+                    .and_then(|attr| attr.value.parse::<u32>().ok())
+            })
+            .flatten();
+
         let mut data = ElementData {
             name,
             id: id_attr_atom,
@@ -160,6 +175,7 @@ impl ElementData {
             template_contents: None,
             background_images: Vec::new(),
             mask_images: Vec::new(),
+            parsed_cellpadding,
         };
         data.flush_is_focussable();
         data
