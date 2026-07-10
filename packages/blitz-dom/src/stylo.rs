@@ -867,19 +867,6 @@ impl<'a> TElement for BlitzNode<'a> {
             push(PropertyDeclaration::BorderSpacing(bs));
         }
 
-        fn push_cell_padding<F>(push: &mut F, px: f32)
-        where
-            F: FnMut(PropertyDeclaration),
-        {
-            use style::values::generics::NonNegative;
-            use style::values::specified::{LengthPercentage, NoCalcLength};
-            let side = NonNegative(LengthPercentage::Length(NoCalcLength::from_px(px)));
-            push(PropertyDeclaration::PaddingTop(side.clone()));
-            push(PropertyDeclaration::PaddingRight(side.clone()));
-            push(PropertyDeclaration::PaddingBottom(side.clone()));
-            push(PropertyDeclaration::PaddingLeft(side));
-        }
-
         fn parse_size_attr(
             value: &str,
             filter_fn: impl FnOnce(&f32) -> bool,
@@ -1028,26 +1015,20 @@ impl<'a> TElement for BlitzNode<'a> {
 
         // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
         // `<table cellpadding="N">` inherits down to every descendant TD/TH
-        // as `padding: Npx`. The UA sheet writes this via a descendant
-        // selector; presentational-hints attach to a single element, so
-        // we walk up from the cell to find the nearest ancestor <table>'s
-        // cellpadding attribute value.
-        if *tag == local_name!("td") || *tag == local_name!("th") {
-            let mut cur = self.parent;
-            while let Some(pid) = cur {
-                let parent = &self.tree()[pid];
-                let Some(pe) = parent.data.downcast_element() else {
-                    cur = parent.parent;
-                    continue;
-                };
-                if pe.name.local != local_name!("table") {
-                    cur = parent.parent;
-                    continue;
-                }
-                if let Some(px) = pe.attr_parsed::<u32>(local_name!("cellpadding")) {
-                    push_cell_padding(&mut push_style, px as f32);
-                }
-                break;
+        // as `padding: Npx`. We can't express "descendant selector reading
+        // an ancestor's attribute value as a length" in plain CSS, so we
+        // parse `cellpadding` once per table (in the mutator, when the
+        // attribute is set) into `--blitz-cellpadding: Npx` and push that
+        // as a pres hint on the `<table>`. Custom-property inheritance
+        // carries the value to descendants; `default.css` resolves it via
+        // `td, th { padding: var(--blitz-cellpadding, 1px); }`.
+        if *tag == local_name!("table") {
+            if let Some(block) = elem.cellpadding_pres_hint.as_ref() {
+                hints.push(ApplicableDeclarationBlock::from_declarations(
+                    block.clone(),
+                    CascadeLevel::new(CascadeOrigin::PresHints),
+                    LayerOrder::root(),
+                ));
             }
         }
     }

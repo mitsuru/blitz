@@ -132,6 +132,12 @@ impl DocumentMutator<'_> {
     pub fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>) -> usize {
         let mut data = ElementData::new(name, attrs);
         data.flush_style_attribute(self.doc.guard(), &self.doc.url.url_extra_data());
+        if data.name.local == local_name!("table") {
+            data.flush_cellpadding_pres_hint(
+                self.doc.guard(),
+                &self.doc.url.url_extra_data(),
+            );
+        }
 
         let id = self.doc.create_node(NodeData::Element(data));
         let node = self.doc.get_node_mut(id).unwrap();
@@ -256,6 +262,14 @@ impl DocumentMutator<'_> {
 
         element.attrs.set(name.clone(), value);
 
+        if element.name.local == local_name!("table")
+            && name.local == local_name!("cellpadding")
+        {
+            let guard = self.doc.guard.clone();
+            let url_extra = self.doc.url.url_extra_data();
+            element.flush_cellpadding_pres_hint(&guard, &url_extra);
+        }
+
         let tag = &element.name.local;
         let attr = &name.local;
 
@@ -343,6 +357,12 @@ impl DocumentMutator<'_> {
 
         if name.local == local_name!("id") {
             element.id = None;
+        }
+
+        if element.name.local == local_name!("table")
+            && name.local == local_name!("cellpadding")
+        {
+            element.cellpadding_pres_hint = None;
         }
 
         // Update text input value

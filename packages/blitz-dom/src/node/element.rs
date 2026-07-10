@@ -68,6 +68,12 @@ pub struct ElementData {
 
     /// The element's template contents (\<template\> elements only)
     pub template_contents: Option<usize>,
+
+    /// Pre-parsed `--blitz-cellpadding: <N>px` declaration block for tables
+    /// carrying a `cellpadding` attribute. Pushed as a presentational hint at
+    /// style time so descendant `<td>`/`<th>` cells inherit the value via
+    /// CSS custom-property inheritance without any DOM walk.
+    pub cellpadding_pres_hint: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
     // /// Whether the node is a [HTML integration point] (https://html.spec.whatwg.org/multipage/#html-integration-point)
     // pub mathml_annotation_xml_integration_point: bool,
 }
@@ -160,9 +166,34 @@ impl ElementData {
             template_contents: None,
             background_images: Vec::new(),
             mask_images: Vec::new(),
+            cellpadding_pres_hint: None,
         };
         data.flush_is_focussable();
         data
+    }
+
+    /// Parse the `cellpadding` attribute value (per HTML spec's "rules for
+    /// parsing non-negative integers") and build a presentational-hint block
+    /// setting the `--blitz-cellpadding` custom property. Called from the
+    /// mutator when a `<table>`'s `cellpadding` attribute is set or cleared.
+    pub fn flush_cellpadding_pres_hint(
+        &mut self,
+        guard: &SharedRwLock,
+        url_extra_data: &UrlExtraData,
+    ) {
+        self.cellpadding_pres_hint = self
+            .attr(local_name!("cellpadding"))
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .map(|px| {
+                let css = format!("--blitz-cellpadding: {px}px");
+                ServoArc::new(guard.wrap(parse_style_attribute(
+                    &css,
+                    url_extra_data,
+                    None,
+                    QuirksMode::NoQuirks,
+                    CssRuleType::Style,
+                )))
+            });
     }
 
     pub fn attrs(&self) -> &[Attribute] {

@@ -555,14 +555,14 @@ td {
     display: table-cell;
     vertical-align: inherit;
     text-align: unset;
-    padding: 1px;
+    padding: var(--blitz-cellpadding, 1px);
 }
 
 th {
     display: table-cell;
     vertical-align: inherit;
     font-weight: bold;
-    padding: 1px;
+    padding: var(--blitz-cellpadding, 1px);
     text-align: -moz-center-or-inherit;
 }
 
